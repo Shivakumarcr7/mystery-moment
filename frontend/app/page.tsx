@@ -11,7 +11,7 @@ export default function MysteryDashboard() {
     setLoading(true);
     setLogs([]);
     try {
-      const res = await fetch("http://localhost:8000/api/play", {
+     const res = await fetch("http://127.0.0.1:8000/api/play",  {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
