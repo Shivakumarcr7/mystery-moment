@@ -1,7 +1,6 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
   serverExternalPackages: ["@morsehq-dev/sdk"],
   allowedDevOrigins: [
     "*.run.app",
