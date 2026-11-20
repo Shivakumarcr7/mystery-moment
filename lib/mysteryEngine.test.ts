@@ -1,11 +1,30 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_GROQ_MODEL,
+  DETECTIVE_TOOLS,
   searchRoom,
   evaluateAccusation,
   playMysteryGame,
+  playMysteryGameDetailed,
+  resolveGroqModel,
   simulatedProvider,
 } from "./mysteryEngine";
+
+test("DETECTIVE_TOOLS defines explicit descriptions for required parameters", () => {
+  const searchTool = DETECTIVE_TOOLS.find((t) => t.function.name === "search_room");
+  const accuseTool = DETECTIVE_TOOLS.find((t) => t.function.name === "submit_accusation");
+  assert.ok(searchTool?.function.parameters.properties.room?.description);
+  assert.ok(accuseTool?.function.parameters.properties.culprit?.description);
+  assert.ok(accuseTool?.function.parameters.properties.motive?.description);
+});
+
+test("resolveGroqModel rejects malformed API keys and falls back to default model", () => {
+  assert.equal(resolveGroqModel("mhq_prod_12345"), DEFAULT_GROQ_MODEL);
+  assert.equal(resolveGroqModel("gsk_secret_key"), DEFAULT_GROQ_MODEL);
+  assert.equal(resolveGroqModel(""), DEFAULT_GROQ_MODEL);
+  assert.equal(resolveGroqModel("llama-3.3-70b-versatile"), "llama-3.3-70b-versatile");
+});
 
 test("searchRoom returns expected clues and tool error for cctv_archive", () => {
   const serverClue = searchRoom("server_room");
@@ -59,4 +78,25 @@ test("playMysteryGame v2 runs optimized 3-step sequence without unnecessary ques
   assert.ok(logs[0]?.text.includes("Searched server_room"));
   assert.ok(logs[1]?.text.includes("Searched coffee_station"));
   assert.ok(logs[2]?.text.includes("Solved: True"));
+});
+
+test("playMysteryGameDetailed tracks telemetry, room visits, and v2 efficiency vs v1", async () => {
+  const v1 = await playMysteryGameDetailed("game_v1_detail", "player_1", "v1", simulatedProvider);
+  const v2 = await playMysteryGameDetailed("game_v2_detail", "player_1", "v2", simulatedProvider);
+
+  assert.equal(v1.summary.solved, true);
+  assert.equal(v1.summary.hasCctvError, true);
+  assert.equal(v1.summary.hasContextBloat, true);
+  assert.equal(v1.summary.noiseWordsInjected, 120);
+  assert.equal(v1.summary.roomsVisited.cctv_archive, "error");
+  assert.equal(v1.summary.roomsVisited.server_room, "searched");
+  assert.equal(v1.summary.roomsVisited.coffee_station, "searched");
+  assert.equal(v1.summary.toolErrors, 1);
+
+  assert.equal(v2.summary.solved, true);
+  assert.equal(v2.summary.hasCctvError, false);
+  assert.equal(v2.summary.roomsVisited.cctv_archive, "unvisited");
+  assert.equal(v2.summary.toolErrors, 0);
+  assert.ok(v2.summary.totalTurns < v1.summary.totalTurns);
+  assert.ok(v2.summary.toolCalls < v1.summary.toolCalls);
 });

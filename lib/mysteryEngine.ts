@@ -1,6 +1,57 @@
 export interface GameLogEntry {
   actor: "Detective" | "Suspect" | "System";
   text: string;
+  id?: string;
+  turn?: number;
+  kind?: "dialogue" | "tool_success" | "tool_error" | "accusation" | "timeout";
+  room?: string;
+  rawPayload?: string;
+  tokenEstimate?: number;
+}
+
+export type RoomId = "server_room" | "coffee_station" | "cctv_archive";
+export type RoomVisitStatus = "unvisited" | "searched" | "error";
+
+export interface GameTraceSummary {
+  solved: boolean;
+  outcome: "case_solved" | "wrong_accusation" | "suspect_escaped";
+  totalTurns: number;
+  toolCalls: number;
+  toolErrors: number;
+  dialogueTurns: number;
+  estimatedTokens: number;
+  noiseWordsInjected: number;
+  roomsVisited: Record<RoomId, RoomVisitStatus>;
+  roomSequence: RoomId[];
+  hasContextBloat: boolean;
+  hasCctvError: boolean;
+  culpritAccused: string | null;
+  motiveCited: string | null;
+}
+
+export interface GameRunResult {
+  gameId: string;
+  playerId: string;
+  promptVersion: "v1" | "v2";
+  provider: "Groq" | "Simulated";
+  timestamp: string;
+  morseTraceId?: string | null;
+  morseShipped?: boolean;
+  logs: GameLogEntry[];
+  summary: GameTraceSummary;
+}
+
+export interface ToolExecutionEvent {
+  toolName: string;
+  args: Record<string, unknown>;
+  result: string;
+  isError: boolean;
+  room?: string;
+}
+
+export interface GameExecutionHooks {
+  onToolExecution?: (event: ToolExecutionEvent) => void;
+  providerLabel?: "Groq" | "Simulated";
 }
 
 export interface GameRequest {
@@ -50,6 +101,38 @@ export const SECRET_CASE: { rooms: Record<string, string> } = {
   },
 };
 
+export interface RoomMetadata {
+  id: RoomId;
+  label: string;
+  wing: string;
+  summary: string;
+  evidenceType: string;
+}
+
+export const ROOM_DIRECTORY: RoomMetadata[] = [
+  {
+    id: "server_room",
+    label: "Server Room",
+    wing: "North Wing · R&D 14",
+    summary: "Electronic badge reader logs and prototype vault terminal.",
+    evidenceType: "Access Telemetry",
+  },
+  {
+    id: "coffee_station",
+    label: "Coffee Station",
+    wing: "Central Atrium",
+    summary: "Shared break counter with discarded receipts and noisy log clutter.",
+    evidenceType: "Financial Trail + 120× Noise",
+  },
+  {
+    id: "cctv_archive",
+    label: "CCTV Archive",
+    wing: "Security Sub-Level",
+    summary: "Legacy camera storage node currently experiencing a 503 outage.",
+    evidenceType: "Offline Service (503)",
+  },
+];
+
 export const DETECTIVE_TOOLS = [
   {
     type: "function" as const,
@@ -62,6 +145,8 @@ export const DETECTIVE_TOOLS = [
         properties: {
           room: {
             type: "string",
+            description:
+              "The room identifier to search: server_room, coffee_station, or cctv_archive.",
             enum: ["server_room", "coffee_station", "cctv_archive"],
           },
         },
@@ -75,12 +160,19 @@ export const DETECTIVE_TOOLS = [
     function: {
       name: "submit_accusation",
       description:
-        "Submit your final accusation after investigating the available clues.",
+        "Submit your final accusation after investigating the available clues. Both culprit and motive strings are required.",
       parameters: {
         type: "object",
         properties: {
-          culprit: { type: "string" },
-          motive: { type: "string" },
+          culprit: {
+            type: "string",
+            description: "Full name of the accused suspect, e.g. Dr. Aris.",
+          },
+          motive: {
+            type: "string",
+            description:
+              "Clear motive backed by evidence, e.g. corporate espionage involving Vortex Robotics.",
+          },
         },
         required: ["culprit", "motive"],
         additionalProperties: false,
@@ -88,6 +180,11 @@ export const DETECTIVE_TOOLS = [
     },
   },
 ];
+
+export function estimateTokenCount(text: string): number {
+  if (!text) return 0;
+  return Math.max(1, Math.ceil(text.trim().length / 4));
+}
 
 export function searchRoom(room: string): string {
   const clue = SECRET_CASE.rooms[room.toLowerCase()] ?? "Room not found.";
@@ -114,8 +211,7 @@ export function evaluateAccusation(culprit: string, motive: string): boolean {
 
 export function getDetectiveSystemPrompt(promptVersion: string): string {
   if (promptVersion === "v2") {
-    return `
-You are Detective Vance.
+    return `You are Detective Vance.
 
 You are conducting an optimized investigation.
 
@@ -124,14 +220,12 @@ Follow this exact sequence:
 1. Call search_room with server_room.
 2. Call search_room with coffee_station.
 3. Analyze both clues.
-4. Call submit_accusation with Dr. Aris as the culprit
-   and corporate espionage involving Vortex Robotics
-   as the motive.
+4. Call submit_accusation with JSON arguments:
+   {"culprit": "Dr. Aris", "motive": "corporate espionage involving Vortex Robotics"}.
 
 Do not ask unnecessary questions.
 Do not accuse before examining both clues.
-Use the available function tools to complete the case.
-`;
+Use the available function tools to complete the case.`;
   }
 
   return (
@@ -260,8 +354,6 @@ export async function simulatedProvider(
     };
   }
 
-  // Prompt v1 (Chatty Detective): interrogates suspect, hits CCTV 503 tool error,
-  // inspects server_room and coffee_station (with 120-token noise injection), then accuses.
   switch (turn) {
     case 1:
       return {
@@ -321,7 +413,8 @@ export async function simulatedProvider(
               name: "submit_accusation",
               arguments: JSON.stringify({
                 culprit: "Dr. Aris",
-                motive: "corporate espionage for Vortex Robotics ($50k wire transfer)",
+                motive:
+                  "corporate espionage for Vortex Robotics ($50k wire transfer)",
               }),
             },
           },
@@ -330,20 +423,53 @@ export async function simulatedProvider(
   }
 }
 
-export async function playMysteryGame(
+function isKnownRoom(room: string): room is RoomId {
+  return (
+    room === "server_room" ||
+    room === "coffee_station" ||
+    room === "cctv_archive"
+  );
+}
+
+export function resolveGroqModel(envModel?: string): string {
+  const candidate = (envModel ?? "").trim();
+  if (
+    !candidate ||
+    candidate.startsWith("mhq_") ||
+    candidate.startsWith("gsk_") ||
+    candidate.startsWith("sk-") ||
+    candidate.length > 64
+  ) {
+    return DEFAULT_GROQ_MODEL;
+  }
+  return candidate;
+}
+
+export async function playMysteryGameDetailed(
   gameId: string,
-  _playerId: string,
-  promptVersion: string = "v1",
-  provider?: CompletionProvider
-): Promise<GameLogEntry[]> {
+  playerId: string,
+  promptVersionInput: string = "v1",
+  provider?: CompletionProvider,
+  hooks?: GameExecutionHooks
+): Promise<GameRunResult> {
+  const promptVersion: "v1" | "v2" = promptVersionInput === "v2" ? "v2" : "v1";
   const gameLog: GameLogEntry[] = [];
   const apiKey = process.env.GROQ_API_KEY;
-  const model = process.env.GROQ_MODEL || DEFAULT_GROQ_MODEL;
+  const model = resolveGroqModel(process.env.GROQ_MODEL);
+  let activeProviderLabel: "Groq" | "Simulated" =
+    hooks?.providerLabel ?? (!provider && Boolean(apiKey) ? "Groq" : "Simulated");
 
   const complete: CompletionProvider =
     provider ??
     (apiKey
-      ? (messages, useTools) => askGroq(messages, useTools, apiKey, model)
+      ? async (messages, useTools, turn, version) => {
+          try {
+            return await askGroq(messages, useTools, apiKey, model);
+          } catch {
+            activeProviderLabel = "Simulated";
+            return simulatedProvider(messages, useTools, turn, version);
+          }
+        }
       : simulatedProvider);
 
   const detectiveSys = getDetectiveSystemPrompt(promptVersion);
@@ -369,7 +495,33 @@ export async function playMysteryGame(
     },
   ];
 
+  const roomsVisited: Record<RoomId, RoomVisitStatus> = {
+    server_room: "unvisited",
+    coffee_station: "unvisited",
+    cctv_archive: "unvisited",
+  };
+  const roomSequence: RoomId[] = [];
+
+  let totalTurns = 0;
+  let toolCallsCount = 0;
+  let toolErrorsCount = 0;
+  let dialogueTurns = 0;
+  let estimatedTokens =
+    estimateTokenCount(detectiveSys) +
+    estimateTokenCount(detectiveMessages[1].content);
+  let noiseWordsInjected = 0;
+  let hasContextBloat = false;
+  let hasCctvError = false;
+  let stepCounter = 0;
+
+  const nextId = () => {
+    stepCounter += 1;
+    return `${gameId}_step_${stepCounter}`;
+  };
+
   for (let turn = 1; turn <= 5; turn++) {
+    totalTurns = turn;
+
     const response = await complete(
       detectiveMessages,
       true,
@@ -395,25 +547,39 @@ export async function playMysteryGame(
     }
 
     detectiveMessages.push(assistantMessage);
+    estimatedTokens += estimateTokenCount(assistantMessage.content);
 
     if (toolCalls.length > 0) {
       for (const call of toolCalls) {
+        toolCallsCount += 1;
         const toolName = call.function.name;
         let parsedArgs: Record<string, unknown>;
 
         try {
           const parsed = JSON.parse(call.function.arguments || "{}");
-          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          if (
+            typeof parsed !== "object" ||
+            parsed === null ||
+            Array.isArray(parsed)
+          ) {
             throw new Error("Tool arguments must be a JSON object.");
           }
           parsedArgs = parsed as Record<string, unknown>;
         } catch (err) {
+          toolErrorsCount += 1;
           const message = err instanceof Error ? err.message : String(err);
           const toolResult = `TOOL_ERROR: Invalid arguments: ${message}`;
+          const tok = estimateTokenCount(toolResult);
+          estimatedTokens += tok;
 
           gameLog.push({
+            id: nextId(),
+            turn,
             actor: "System",
+            kind: "tool_error",
             text: `[Tool Error] ${toolName}: ${toolResult}`,
+            rawPayload: toolResult,
+            tokenEstimate: tok,
           });
 
           detectiveMessages.push({
@@ -425,18 +591,64 @@ export async function playMysteryGame(
         }
 
         if (toolName === "search_room") {
-          const room = String(parsedArgs.room ?? "");
+          const room = String(parsedArgs.room ?? "").toLowerCase();
           const toolResult = searchRoom(room);
+          const tok = estimateTokenCount(toolResult);
+          estimatedTokens += tok;
+
+          const noiseMatches = toolResult.match(/NOISE /g);
+          if (noiseMatches && noiseMatches.length > 0) {
+            noiseWordsInjected += noiseMatches.length;
+            hasContextBloat = true;
+          }
 
           if (toolResult.startsWith("TOOL_ERROR:")) {
+            toolErrorsCount += 1;
+            if (room === "cctv_archive") {
+              hasCctvError = true;
+            }
+            if (isKnownRoom(room)) {
+              roomsVisited[room] = "error";
+              roomSequence.push(room);
+            }
+            hooks?.onToolExecution?.({
+              toolName: "search_room",
+              args: parsedArgs,
+              result: toolResult,
+              isError: true,
+              room,
+            });
             gameLog.push({
+              id: nextId(),
+              turn,
               actor: "System",
+              kind: "tool_error",
+              room,
               text: `[Tool Error] ${room}: ${toolResult}`,
+              rawPayload: toolResult,
+              tokenEstimate: tok,
             });
           } else {
+            if (isKnownRoom(room)) {
+              roomsVisited[room] = "searched";
+              roomSequence.push(room);
+            }
+            hooks?.onToolExecution?.({
+              toolName: "search_room",
+              args: parsedArgs,
+              result: toolResult,
+              isError: false,
+              room,
+            });
             gameLog.push({
+              id: nextId(),
+              turn,
               actor: "System",
+              kind: "tool_success",
+              room,
               text: `[Tool] Searched ${room}: ${toolResult.slice(0, 100)}...`,
+              rawPayload: toolResult,
+              tokenEstimate: tok,
             });
           }
 
@@ -450,18 +662,64 @@ export async function playMysteryGame(
           const motive = String(parsedArgs.motive ?? "").trim();
           const toolResult = submitAccusation(accused, motive);
           const solved = evaluateAccusation(accused, motive);
+          const tok = estimateTokenCount(toolResult);
+          estimatedTokens += tok;
 
-          gameLog.push({
-            actor: "System",
-            text: `Accusation: ${toolResult}. Solved: ${solved ? "True" : "False"}`,
+          hooks?.onToolExecution?.({
+            toolName: "submit_accusation",
+            args: { culprit: accused, motive },
+            result: toolResult,
+            isError: false,
           });
 
-          return gameLog;
-        } else {
-          const toolResult = `TOOL_ERROR: Unknown tool ${toolName}`;
           gameLog.push({
+            id: nextId(),
+            turn,
             actor: "System",
+            kind: "accusation",
+            text: `Accusation: ${toolResult}. Solved: ${solved ? "True" : "False"}`,
+            rawPayload: JSON.stringify({ culprit: accused, motive, solved }, null, 2),
+            tokenEstimate: tok,
+          });
+
+          return {
+            gameId,
+            playerId,
+            promptVersion,
+            provider: activeProviderLabel,
+            timestamp: new Date().toISOString(),
+            logs: gameLog,
+            summary: {
+              solved,
+              outcome: solved ? "case_solved" : "wrong_accusation",
+              totalTurns,
+              toolCalls: toolCallsCount,
+              toolErrors: toolErrorsCount,
+              dialogueTurns,
+              estimatedTokens,
+              noiseWordsInjected,
+              roomsVisited,
+              roomSequence,
+              hasContextBloat,
+              hasCctvError,
+              culpritAccused: accused || null,
+              motiveCited: motive || null,
+            },
+          };
+        } else {
+          toolErrorsCount += 1;
+          const toolResult = `TOOL_ERROR: Unknown tool ${toolName}`;
+          const tok = estimateTokenCount(toolResult);
+          estimatedTokens += tok;
+
+          gameLog.push({
+            id: nextId(),
+            turn,
+            actor: "System",
+            kind: "tool_error",
             text: toolResult,
+            rawPayload: toolResult,
+            tokenEstimate: tok,
           });
           detectiveMessages.push({
             role: "tool",
@@ -473,10 +731,18 @@ export async function playMysteryGame(
       continue;
     }
 
+    dialogueTurns += 1;
     const question = response.content || "Where were you?";
+    const questionTok = estimateTokenCount(question);
+    estimatedTokens += questionTok;
+
     gameLog.push({
+      id: nextId(),
+      turn,
       actor: "Detective",
+      kind: "dialogue",
       text: question,
+      tokenEstimate: questionTok,
     });
 
     suspectMessages.push({
@@ -492,14 +758,21 @@ export async function playMysteryGame(
     );
 
     const answer = suspectResponse.content || "I want a lawyer.";
+    const answerTok = estimateTokenCount(answer);
+    estimatedTokens += answerTok;
+
     suspectMessages.push({
       role: "assistant",
       content: answer,
     });
 
     gameLog.push({
+      id: nextId(),
+      turn,
       actor: "Suspect",
+      kind: "dialogue",
       text: answer,
+      tokenEstimate: answerTok,
     });
 
     detectiveMessages.push({
@@ -509,9 +782,51 @@ export async function playMysteryGame(
   }
 
   gameLog.push({
+    id: nextId(),
+    turn: 5,
     actor: "System",
+    kind: "timeout",
     text: `Time ran out for ${gameId}. Suspect escaped.`,
+    tokenEstimate: 10,
   });
 
-  return gameLog;
+  return {
+    gameId,
+    playerId,
+    promptVersion,
+    provider: activeProviderLabel,
+    timestamp: new Date().toISOString(),
+    logs: gameLog,
+    summary: {
+      solved: false,
+      outcome: "suspect_escaped",
+      totalTurns,
+      toolCalls: toolCallsCount,
+      toolErrors: toolErrorsCount,
+      dialogueTurns,
+      estimatedTokens,
+      noiseWordsInjected,
+      roomsVisited,
+      roomSequence,
+      hasContextBloat,
+      hasCctvError,
+      culpritAccused: null,
+      motiveCited: null,
+    },
+  };
+}
+
+export async function playMysteryGame(
+  gameId: string,
+  playerId: string,
+  promptVersion: string = "v1",
+  provider?: CompletionProvider
+): Promise<GameLogEntry[]> {
+  const result = await playMysteryGameDetailed(
+    gameId,
+    playerId,
+    promptVersion,
+    provider
+  );
+  return result.logs;
 }
